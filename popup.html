@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <title>Story Zoom</title>
+  <style>
+    :root { color-scheme: light dark; --accent: #e1306c; --muted: #8a8a8a; --card: rgba(127, 127, 127, 0.12); }
+    body { width: 300px; margin: 0; padding: 14px 16px 16px; font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    h1 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+    h1 img { width: 22px; height: 22px; }
+    .row { display: flex; justify-content: space-between; margin: 3px 0; }
+    .muted { color: var(--muted); }
+    .card { background: var(--card); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+    .update { border: 1px solid var(--accent); }
+    .update strong { color: var(--accent); }
+    code { font-size: 12px; background: var(--card); padding: 1px 5px; border-radius: 4px; }
+    kbd { font: 600 11px/1 ui-monospace, monospace; border: 1px solid var(--muted); border-bottom-width: 2px; border-radius: 4px; padding: 2px 5px; }
+    ul { margin: 6px 0 0; padding-left: 18px; }
+    li { margin: 2px 0; }
+    button { width: 100%; margin-top: 4px; padding: 8px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: progress; }
+  </style>
+</head>
+<body>
+  <h1><img src="icons/icon48.png" alt="">Story Zoom &amp; İndir</h1>
+
+  <div class="row"><span class="muted">Yüklü sürüm</span><b id="version">–</b></div>
+  <div class="row"><span class="muted">GitHub'daki sürüm</span><b id="remote">–</b></div>
+  <div class="row"><span class="muted">Son kontrol</span><span id="checked">–</span></div>
+
+  <div id="updated" class="card" hidden></div>
+  <div id="update" class="card update" hidden>
+    <strong>Yeni sürüm var!</strong><br>
+    Eklenti klasöründeki <code>update.bat</code> (Mac/Linux: <code>update.sh</code>) dosyasını çalıştırın.
+    Eklenti bir dakika içinde kendini yeniler; sonra Instagram sekmesini yenileyin.
+  </div>
+  <div id="error" class="card" hidden></div>
+
+  <button id="check" type="button">Güncellemeyi kontrol et</button>
+
+  <div class="card">
+    <b>Kullanım</b>
+    <ul>
+      <li>Fareyi fotoğraf / video / hikaye halkasının üstüne getirin → büyük açılır</li>
+      <li><kbd>W</kbd> büyüt · <kbd>Q</kbd> küçült · <kbd>S</kbd> indir</li>
+      <li><kbd>A</kbd>/<kbd>D</kbd> önceki/sonraki · <kbd>F</kbd> tam ekran</li>
+      <li><kbd>H</kbd> fareyle açmayı aç/kapat · <kbd>Esc</kbd> kapat</li>
+    </ul>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

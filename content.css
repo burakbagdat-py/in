@@ -161,3 +161,49 @@
 #igsz-toast.igsz-error {
   background: rgba(190, 30, 45, 0.95);
 }
+
+/* Fareyle üzerine gelince açılan önizleme (fareyi engellememesi için pointer-events: none) */
+#igsz-preview {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483500;
+  background: rgba(0, 0, 0, 0.82);
+  pointer-events: none;
+  overflow: hidden;
+  animation: igsz-fade-in 0.12s ease-out;
+}
+#igsz-preview .igsz-pv-stage {
+  position: absolute;
+  inset: 0;
+}
+#igsz-preview .igsz-pv-media {
+  position: absolute;
+  left: 0;
+  top: 0;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+}
+#igsz-preview .igsz-pv-info {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 32px);
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: rgba(30, 30, 30, 0.88);
+  color: #fff;
+  font: 13px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#igsz-preview .igsz-pv-info.igsz-error {
+  background: rgba(190, 30, 45, 0.95);
+}
+@keyframes igsz-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}

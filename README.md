@@ -15,20 +15,23 @@ Fotoğraf ve video hikayeleri, öne çıkanlar (highlights) dahil çalışır.
 
 ## Kullanım
 
-Bir hikaye açtığınızda ekranın sağ ortasında iki buton belirir:
+Bir hikaye açtığınızda ekranın sağ ortasında iki buton belirir (🔍 büyüt, ⬇ indir). Klavyeyle:
 
-| Buton | Kısayol | İşlev |
+| Tuş | Hikaye sayfasında | Büyütme ekranında |
 |---|---|---|
-| 🔍 | `Alt + Z` | Hikayeyi tam ekran görüntüleyicide açar (hikaye arka planda duraklatılır) |
-| ⬇ | `Alt + D` | Hikayeyi orijinal kalitede indirir |
+| `W` | Hikayeyi tam çözünürlükte büyütme ekranında açar | Daha da yakınlaştırır |
+| `Q` | – | Uzaklaştırır |
+| `S` | Hikayeyi indirir | Hikayeyi indirir |
+| `A` / `D` | Önceki / sonraki hikaye | Önceki / sonraki hikayeye geçer, büyütme ekranı açık kalır |
+| `Esc` | – | Kapatır |
 
-Görüntüleyicideyken:
+Büyütme ekranında ayrıca:
 
 - **Fare tekerleği / touchpad'de iki parmakla sıkıştırma**: imlecin olduğu noktaya yakınlaştır
-- **Sürükle**: kaydır · **Çift tık**: 1× ↔ 3×
-- `+` / `-` yakınlaştır/uzaklaştır, `0` ekrana sığdır, ok tuşları kaydır
-- `D` indir, `Esc` kapat
+- **Sürükle** veya ok tuşları: kaydır · **Çift tık**: 1× ↔ 3× · `0`: ekrana sığdır
 - Videolarda: `Boşluk` oynat/duraklat, `M` ses, alttaki çubukla ileri/geri sarma
+
+Hikayeye yanıt yazarken tuşlar devre dışıdır, yazdıklarınız etkilenmez.
 
 Yüzde göstergesi gerçek piksel boyutuna göredir: **100% = orijinal çözünürlük**.
 

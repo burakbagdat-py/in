@@ -82,6 +82,8 @@
         'X-Requested-With': 'XMLHttpRequest'
       }
     });
+    if (res.status === 401 || res.status === 403) throw new Error('Instagram oturumu bulunamadı, giriş yapıp sayfayı yenileyin');
+    if (res.status === 429) throw new Error('Instagram çok fazla istek dedi, biraz bekleyip tekrar deneyin');
     if (!res.ok) throw new Error(`Instagram API hatası (${res.status})`);
     return res.json();
   }
@@ -225,6 +227,7 @@
 
     const domNode = findActiveDomMedia();
     const dom = domNode ? domMediaInfo(domNode) : null;
+    let apiError = null;
 
     try {
       const reelId = info.reelId || (await getUserId(info.username));
@@ -248,12 +251,14 @@
         if (media) return { ...media, domNode };
       }
     } catch (err) {
+      apiError = err;
       console.warn('[Story Zoom] API ile çözülemedi, sayfadaki medyaya dönülüyor:', err);
     }
 
     if (dom && dom.url && !dom.url.startsWith('blob:')) {
       return { ...dom, id: info.mediaId || String(Date.now()), owner: info.label, domNode };
     }
+    if (apiError) throw new Error(`Hikaye alınamadı: ${apiError.message}`);
     throw new Error('Hikaye medyası bulunamadı. Sayfayı yenileyip tekrar deneyin.');
   }
 
@@ -298,6 +303,46 @@
     return false;
   }
 
+  const NEXT_LABELS = /^(next|ileri|sonraki|siguiente|weiter|suivant|avanti|далее)$/i;
+  const PREV_LABELS = /^(previous|önceki|geri|anterior|zurück|précédent|indietro|назад)$/i;
+
+  // Instagram'ın ileri/geri butonuna tıkla; bulunamazsa ok tuşunu taklit et.
+  function navigateStory(dir) {
+    const re = dir > 0 ? NEXT_LABELS : PREV_LABELS;
+    for (const node of document.querySelectorAll('[aria-label]')) {
+      if (node.closest('#igsz-overlay, #' + ROOT_ID)) continue;
+      if (!re.test(node.getAttribute('aria-label').trim())) continue;
+      const target = node.closest('[role="button"], button') || node;
+      const r = target.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      target.click();
+      return;
+    }
+    const key = dir > 0 ? 'ArrowRight' : 'ArrowLeft';
+    const init = { key, code: key, keyCode: dir > 0 ? 39 : 37, which: dir > 0 ? 39 : 37, bubbles: true, cancelable: true };
+    (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', init));
+    (document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keyup', init));
+  }
+
+  // Görüntüleyici açıkken hikaye değiştir: kapat, ilerlet, yeni hikayeyi aç.
+  async function navigateAndReopen(dir) {
+    closeViewer();
+    const before = location.pathname;
+    navigateStory(dir);
+    const start = Date.now();
+    while (location.pathname === before && Date.now() - start < 2500) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!isStoryPage()) return;
+    await new Promise((r) => setTimeout(r, 400)); // yeni hikayenin DOM'a gelmesini bekle
+    run('zoom');
+  }
+
+  function isTyping(e) {
+    const t = e.target;
+    return t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+  }
+
   // ---------------------------------------------------------------------------
   // Zoom görüntüleyici
   // ---------------------------------------------------------------------------
@@ -333,16 +378,16 @@
 
     const bar = el('div', { class: 'igsz-bar' }, [
       ...(isVideo ? [playBtn, muteBtn, seek, el('span', { class: 'igsz-sep' })] : []),
-      btn(ICONS.minus, 'Uzaklaştır (-)', () => zoomAtCenter(1 / 1.4)),
+      btn(ICONS.minus, 'Uzaklaştır (Q / -)', () => zoomAtCenter(1 / 1.4)),
       zoomLabel,
-      btn(ICONS.plus, 'Yakınlaştır (+)', () => zoomAtCenter(1.4)),
+      btn(ICONS.plus, 'Yakınlaştır (W / +)', () => zoomAtCenter(1.4)),
       btn(ICONS.reset, 'Sığdır (0)', () => reset()),
       el('span', { class: 'igsz-sep' }),
-      btn(ICONS.download, 'İndir (D)', () => doDownload()),
+      btn(ICONS.download, 'İndir (S)', () => doDownload()),
       btn(ICONS.close, 'Kapat (Esc)', () => closeViewer())
     ]);
 
-    const hint = el('div', { class: 'igsz-hint', text: 'Tekerlek / iki parmak: yakınlaştır · Sürükle: kaydır · Çift tık: 1×/3×' });
+    const hint = el('div', { class: 'igsz-hint', text: 'W/Q veya tekerlek: yakınlaştır · S: indir · A/D: önceki/sonraki hikaye · Esc: kapat' });
     const overlay = el('div', { id: 'igsz-overlay', tabindex: '-1' }, [stage, bar, hint]);
     document.body.append(overlay);
     overlay.focus();
@@ -517,18 +562,21 @@
     const onKey = (e) => {
       if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
       const handled = (() => {
-        switch (e.key) {
-          case 'Escape': closeViewer(); return true;
-          case '+': case '=': zoomAtCenter(1.4); return true;
-          case '-': case '_': zoomAtCenter(1 / 1.4); return true;
+        if (e.ctrlKey || e.metaKey || e.altKey) return false;
+        switch (e.key.toLowerCase()) {
+          case 'escape': closeViewer(); return true;
+          case 'w': case '+': case '=': zoomAtCenter(1.4); return true;
+          case 'q': case '-': case '_': zoomAtCenter(1 / 1.4); return true;
           case '0': reset(); return true;
-          case 'd': case 'D': doDownload(); return true;
+          case 's': doDownload(); return true;
+          case 'a': navigateAndReopen(-1); return true;
+          case 'd': navigateAndReopen(1); return true;
           case ' ': togglePlay(); return true;
-          case 'm': case 'M': toggleMute(); return true;
-          case 'ArrowLeft': state.x += 60; apply(); return true;
-          case 'ArrowRight': state.x -= 60; apply(); return true;
-          case 'ArrowUp': state.y += 60; apply(); return true;
-          case 'ArrowDown': state.y -= 60; apply(); return true;
+          case 'm': toggleMute(); return true;
+          case 'arrowleft': state.x += 60; apply(); return true;
+          case 'arrowright': state.x -= 60; apply(); return true;
+          case 'arrowup': state.y += 60; apply(); return true;
+          case 'arrowdown': state.y -= 60; apply(); return true;
           default: return false;
         }
       })();
@@ -602,8 +650,8 @@
   function ensureToolbar() {
     if (root && root.isConnected) return;
     root = el('div', { id: ROOT_ID }, [
-      el('button', { class: 'igsz-fab', type: 'button', title: 'Hikayeyi yakınlaştır (Alt+Z)', 'aria-label': 'Hikayeyi yakınlaştır', html: ICONS.zoom, onclick: () => run('zoom') }),
-      el('button', { class: 'igsz-fab', type: 'button', title: 'Hikayeyi indir (Alt+D)', 'aria-label': 'Hikayeyi indir', html: ICONS.download, onclick: () => run('download') })
+      el('button', { class: 'igsz-fab', type: 'button', title: 'Hikayeyi büyüt (W)', 'aria-label': 'Hikayeyi yakınlaştır', html: ICONS.zoom, onclick: () => run('zoom') }),
+      el('button', { class: 'igsz-fab', type: 'button', title: 'Hikayeyi indir (S)', 'aria-label': 'Hikayeyi indir', html: ICONS.download, onclick: () => run('download') })
     ]);
     // Instagram tıklamayı "sonraki hikaye" olarak algılamasın.
     for (const type of ['pointerdown', 'mousedown', 'mouseup', 'touchstart']) {
@@ -622,16 +670,19 @@
     }
   }
 
-  window.addEventListener('keydown', (e) => {
-    if (viewer || !e.altKey || !isStoryPage()) return;
-    if (e.code === 'KeyZ') {
+  // Hikaye sayfasında: W büyüt, S indir, A/D önceki/sonraki hikaye.
+  window.addEventListener(
+    'keydown',
+    (e) => {
+      if (viewer || e.repeat || e.ctrlKey || e.metaKey || e.altKey || isTyping(e) || !isStoryPage()) return;
+      const action = { w: () => run('zoom'), s: () => run('download'), a: () => navigateStory(-1), d: () => navigateStory(1) }[e.key.toLowerCase()];
+      if (!action) return;
       e.preventDefault();
-      run('zoom');
-    } else if (e.code === 'KeyD') {
-      e.preventDefault();
-      run('download');
-    }
-  });
+      e.stopImmediatePropagation();
+      action();
+    },
+    true
+  );
 
   // Instagram tek sayfalık bir uygulama; URL değişimini izle.
   let lastPath = '';
@@ -642,4 +693,5 @@
     }
   }, 400);
   syncToolbar();
+  console.info('[Story Zoom] yüklendi');
 })();

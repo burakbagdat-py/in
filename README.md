@@ -42,15 +42,23 @@ schtasks /create /tn "Story Zoom guncelle" /sc hourly /f /tr "\"C:\Users\KULLANI
 
 ## Kullanım
 
-**Fareyle üzerine gelin**: akıştaki gönderiler, profil kılavuzu, reels, açık hikaye ve hikaye halkaları
-(halkanın üstüne gelince o kişinin hikayeleri açılır, görüldü olarak işaretlenmez). Fareyi çekince kapanır.
+**Fareyle üzerine gelin**: akıştaki fotoğraf ve videolar, profil kılavuzu, reels, açık hikaye, hikaye halkaları,
+profil fotoğrafları ve öne çıkanlar. Açılan her şey Aero (buzlu cam) görünümünde gelir; fareyi çekince kapanır.
+
+- **Profil fotoğrafı / hikaye halkası**: kişi hikaye paylaştıysa hikayesi açılır (görüldü olarak işaretlenmez).
+  Ardından kişinin **öne çıkanları (📌 pinler)** gelir. Hikayesi yoksa önce öne çıkanları, o da yoksa HD profil fotoğrafı.
+- **Fare tekerleği**: önizleme açıkken tekerleği aşağı/yukarı çevirerek **sonsuz** gezinin:
+  kişinin hikayeleri → öne çıkanları → hikaye tepsinizdeki sıradaki kişiler… Sıradakiler arka planda önceden yüklenir.
+- Tek bir fotoğrafın önizlemesi açıkken tekerleği çevirirseniz önizleme kapanır ve sayfa normal kayar;
+  kaydırma sırasında ve sonrasında fareyi oynatmadığınız sürece hiçbir şey kendiliğinden açılmaz.
 
 | Tuş | Ne yapar |
 |---|---|
+| Tekerlek | Önceki / sonraki hikaye, öne çıkan ya da kaydırmalı gönderinin fotoğrafı |
 | `W` | Büyüt (önizleme açık değilse farenin altındakini açar) |
 | `Q` | Küçült |
 | `S` | İndir (farenin altındakini ya da açık olanı) |
-| `A` / `D` | Önceki / sonraki: hikayeler, kaydırmalı gönderinin fotoğrafları |
+| `A` / `D` | Önceki / sonraki (tekerlekle aynı) |
 | `F` | Tam ekran görüntüleyici (fareyle sürükle, tekerlekle yakınlaştır) |
 | `M` | Videonun sesini aç/kapat |
 | `H` | Fareyle açmayı aç/kapat |
@@ -70,7 +78,8 @@ Bir yere yazı yazarken (ör. hikayeye yanıt) tuşlar devre dışıdır.
 ## Nasıl çalışır
 
 - Medya, Instagram'ın kendi web API'sinden sizin oturumunuzla alınır (`/api/v1/media/<id>/info/`,
-  `/api/v1/feed/reels_media/`, `/api/v1/users/web_profile_info/`). Böylece ekrandaki küçültülmüş sürüm yerine
+  `/api/v1/feed/reels_media/`, `/api/v1/users/web_profile_info/`, `/api/v1/highlights/<id>/highlights_tray/`,
+  `/api/v1/feed/reels_tray/`). Böylece ekrandaki küçültülmüş sürüm yerine
   **en yüksek çözünürlüklü** fotoğraf / video kullanılır. Instagram videoları sayfada `blob:` olarak oynattığı için
   videolar ancak bu yolla indirilebilir.
 - API'ye ulaşılamazsa sayfadaki görsel yedek olarak kullanılır (sadece fotoğraflar için).

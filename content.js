@@ -5,7 +5,7 @@
   if (window.__igszLoaded) return;
   window.__igszLoaded = true;
 
-  const VERSION = '2.1.0';
+  const VERSION = '2.2.0';
 
   // Instagram web istemcisinin kendi kullandığı uygulama kimliği.
   const IG_APP_ID = '936619743392459';
@@ -327,6 +327,18 @@
     return hasRing ? avatarUser(node) : null;
   }
 
+  // Profildeki öne çıkan (highlight) dairesi: /stories/highlights/<id>/
+  function highlightFor(node) {
+    const link = node.closest('a[href*="/stories/highlights/"]');
+    const m = link?.getAttribute('href').match(/\/stories\/highlights\/(\d+)/);
+    return m ? `highlight:${m[1]}` : null;
+  }
+
+  function profileOwnerFromPath() {
+    const parts = location.pathname.split('/').filter(Boolean);
+    return parts.length >= 1 && !RESERVED.has(parts[0]) ? parts[0] : null;
+  }
+
   const RESERVED = new Set(['p', 'reel', 'reels', 'tv', 'stories', 'explore', 'direct', 'accounts', 'about', 'legal', 'web']);
 
   function avatarUser(node) {
@@ -391,16 +403,112 @@
     throw new Error(apiError ? `Hikaye alınamadı: ${apiError.message}` : 'Hikaye medyası bulunamadı');
   }
 
-  async function resolveUserStories(username) {
+  // --- Hikaye dizileri: bir kişinin hikayeleri → öne çıkanları (pinler) → tepsideki diğer kişiler ---
+  // "loaders" kuyruğu: sıradaki parça gerektiğinde (tekerlek / D) yüklenir, böylece geçiş sonsuz olur.
+
+  function getHighlightsTray(userId) {
+    return cached(`hl:${userId}`, async () => {
+      const json = await igApi(`/api/v1/highlights/${encodeURIComponent(userId)}/highlights_tray/`);
+      return (json?.tray || []).map((h) => ({
+        id: String(h.id).startsWith('highlight:') ? String(h.id) : `highlight:${h.id}`,
+        title: h.title || ''
+      }));
+    });
+  }
+
+  function getReelsTray() {
+    return cached('tray', async () => {
+      const json = await igApi('/api/v1/feed/reels_tray/');
+      return (json?.tray || []).filter((t) => t.user?.username).map((t) => ({ id: String(t.user.pk ?? t.id), username: t.user.username }));
+    });
+  }
+
+  function reelToMedia(reel, owner, label) {
+    return (reel?.items || [])
+      .map((it) => {
+        const m = itemToMedia(it, owner);
+        if (m) {
+          m.taken_at = it.taken_at;
+          m.label = label || '';
+        }
+        return m;
+      })
+      .filter(Boolean);
+  }
+
+  function highlightsLoader(user, afterId = null) {
+    const fn = async (queue) => {
+      let tray = await getHighlightsTray(user.id).catch(() => []);
+      if (afterId) tray = tray.slice(tray.findIndex((h) => h.id === afterId) + 1);
+      queue.unshift(...tray.map((h) => async () => reelToMedia(await getReel(h.id).catch(() => null), user.username, `📌 ${h.title}`)));
+      return [];
+    };
+    return fn;
+  }
+
+  function trayLoader(skipUsers) {
+    const fn = async (queue) => {
+      const tray = await getReelsTray().catch(() => []);
+      queue.push(
+        ...tray
+          .filter((t) => !skipUsers.has(t.username))
+          .map((t) => async () => reelToMedia(await getReel(t.id).catch(() => null), t.username, ''))
+      );
+      return [];
+    };
+    fn.isTray = true;
+    return fn;
+  }
+
+  // Kuyruktan medya gelene kadar yükle. stopAtTray: başkalarının hikayelerine geçme.
+  async function takeMore(queue, stopAtTray = false) {
+    while (queue.length) {
+      if (stopAtTray && queue[0].isTray) return [];
+      const items = await queue.shift()(queue);
+      if (items.length) return items;
+    }
+    return [];
+  }
+
+  async function resolveUserSequence(username) {
     const user = await getProfile(username);
-    const reel = await getReel(user.id);
-    const items = reel?.items || [];
-    if (!items.length) return null;
-    const list = items.map((it) => itemToMedia(it, username)).filter(Boolean);
-    // İlk görülmemiş hikayeden başla.
-    let index = items.findIndex((it) => reel.seen && it.taken_at > reel.seen);
-    if (index < 0) index = 0;
-    return { list, index, story: true };
+    const loaders = [highlightsLoader({ id: user.id, username }), trayLoader(new Set([username]))];
+    let list = [];
+    let index = 0;
+    let note = null;
+    try {
+      const reel = await getReel(user.id);
+      list = reelToMedia(reel, username, '');
+      // İlk görülmemiş hikayeden başla.
+      index = Math.max(0, (reel?.items || []).findIndex((it) => reel.seen && it.taken_at > reel.seen));
+    } catch (err) {
+      console.warn('[Story Zoom] Hikaye alınamadı:', err);
+      note = `Hikaye alınamadı (${err.message})`;
+    }
+    if (!list.length) {
+      list = await takeMore(loaders, true);
+      if (list.length) note ||= 'Aktif hikaye yok, öne çıkanlar gösteriliyor';
+    }
+    if (!list.length) {
+      const url = user.profile_pic_url_hd || user.profile_pic_url;
+      if (url) list = [{ type: 'image', url, id: 'profil', owner: username, label: 'Profil resmi' }];
+      note ||= 'Aktif hikaye ve öne çıkan yok';
+    }
+    if (!list.length) throw new Error(note || 'Bu kişi için bir şey bulunamadı');
+    return { list, index: Math.min(index, list.length - 1), story: true, note, loaders };
+  }
+
+  async function resolveHighlight(reelId, username) {
+    const reel = await getReel(reelId);
+    const list = reelToMedia(reel, username || 'instagram', '📌');
+    if (!list.length) throw new Error('Öne çıkan boş');
+    const loaders = [];
+    if (username) {
+      const user = await getProfile(username).catch(() => null);
+      if (user) loaders.push(highlightsLoader({ id: user.id, username }, reelId));
+    }
+    loaders.push(trayLoader(new Set(username ? [username] : [])));
+    return { list, index: 0, story: true, loaders };
   }
 
   async function resolvePost(code, dom) {
@@ -408,16 +516,10 @@
     const owner = item.user?.username;
     const children = item.carousel_media?.length ? item.carousel_media : [item];
     const list = children.map((c) => itemToMedia(c, owner)).filter(Boolean);
+    list.forEach((m) => (m.taken_at = item.taken_at));
     let index = dom ? indexByFile(children, dom.urls) : -1;
     if (index < 0 && dom?.type === 'video') index = list.findIndex((m) => m.type === 'video');
     return { list, index: Math.max(0, index), story: false };
-  }
-
-  async function resolveProfilePic(username) {
-    const user = await getProfile(username);
-    const url = user.profile_pic_url_hd || user.profile_pic_url;
-    if (!url) return null;
-    return { list: [{ type: 'image', url, id: 'profil', owner: username }], index: 0, story: false };
   }
 
   async function resolveNode(node) {
@@ -425,25 +527,19 @@
 
     // Hikaye sayfasında ortadaki büyük medya her zaman hikayedir (avatar değilse).
     if (isStoryPage() && (!node || node === findActiveStoryNode() || (!isProfilePic(node) && visibleArea(node) >= 40_000))) {
-      return resolveStory(node, dom);
+      const res = await resolveStory(node, dom);
+      const info = parseStoryPath();
+      return { ...res, loaders: [trayLoader(new Set(info?.username ? [info.username] : []))] };
     }
 
     try {
-      // Avatar ya da hikaye halkası: önce kişinin hikayesi, yoksa HD profil resmi.
+      const hl = node && highlightFor(node);
+      if (hl) return await resolveHighlight(hl, profileOwnerFromPath());
+
+      // Avatar ya da hikaye halkası: hikayeler → öne çıkanlar → (yoksa) HD profil resmi.
       const user = node && (storyRingUser(node) || (isProfilePic(node) ? avatarUser(node) : null));
-      if (user) {
-        let note;
-        try {
-          const stories = await resolveUserStories(user);
-          if (stories) return stories;
-          note = 'Aktif hikaye yok, profil resmi gösteriliyor';
-        } catch (err) {
-          console.warn('[Story Zoom] Hikaye alınamadı:', err);
-          note = `Hikaye alınamadı (${err.message}), profil resmi gösteriliyor`;
-        }
-        const pic = await resolveProfilePic(user).catch(() => null);
-        if (pic) return { ...pic, note };
-      }
+      if (user) return await resolveUserSequence(user);
+
       const code = node && shortcodeFor(node);
       if (code) return await resolvePost(code, dom);
     } catch (err) {
@@ -586,6 +682,13 @@
 
   // ---------------------------------------------------------------------------
   // Fareyle üzerine gelince açılan önizleme
+  //
+  // Kararlılık kuralları:
+  //  - Önizleme açıkken başka hiçbir şey açılmaya çalışılmaz.
+  //  - Açık önizleme DOM öğesine değil, kaynağın ekrandaki alanına bağlıdır (Instagram öğeleri
+  //    sürekli yeniden çizer; video oynamaya başlayınca görselin yerine video gelir vb.).
+  //  - Kaydırma sırasında ve hemen sonrasında hiçbir şey açılmaz; tarayıcının kaydırma sonrası
+  //    gönderdiği sahte "fare hareketi" olayları yok sayılır.
   // ---------------------------------------------------------------------------
 
   let hoverEnabled = true;
@@ -593,17 +696,23 @@
     hoverEnabled = localStorage.getItem('igsz-hover') !== 'off';
   } catch {}
 
+  const CLOSE_DELAY = 140;
+  const SCROLL_QUIET = 350;
   const mouse = { x: -1, y: -1 };
-  const hover = { node: null, timer: 0, token: 0, preview: null, suppress: null };
+  const hover = { candidate: null, timer: 0, closeTimer: 0, token: 0, preview: null, suppressRect: null, quietUntil: 0 };
 
-  const contains = (r, x, y) => x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  const contains = (r, x, y, pad = 0) => x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad;
+  const rectOf = (node) => {
+    const r = node.getBoundingClientRect();
+    return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+  };
 
   function acceptMedia(node, x, y) {
     if (node.tagName !== 'IMG' && node.tagName !== 'VIDEO') return false;
     const r = node.getBoundingClientRect();
     if (!contains(r, x, y)) return false;
     if (r.width >= MIN_MEDIA && r.height >= MIN_MEDIA) return true;
-    return r.width >= 28 && r.height >= 28 && Boolean(storyRingUser(node));
+    return r.width >= 28 && r.height >= 28 && Boolean(highlightFor(node) || storyRingUser(node));
   }
 
   function mediaAtPoint(x, y) {
@@ -611,77 +720,140 @@
     const stack = document.elementsFromPoint(x, y);
     for (const node of stack) {
       if (node.closest(UI_SELECTOR)) return null;
-      if (acceptMedia(node, x, y)) return node;
+      if (acceptMedia(node, x, y)) return preferVideo(node);
     }
     // Görselin üstünde pointer-events:none ya da şeffaf katman olabilir: yakın çevresinde ara.
     for (const node of stack.slice(0, 3)) {
       const scope = node.parentElement?.parentElement || node.parentElement;
       if (!scope || scope === document.body || scope === document.documentElement) continue;
-      for (const m of scope.querySelectorAll('img, video')) {
-        if (!m.closest(UI_SELECTOR) && acceptMedia(m, x, y)) return m;
+      for (const m of scope.querySelectorAll('video, img')) {
+        if (!m.closest(UI_SELECTOR) && acceptMedia(m, x, y)) return preferVideo(m);
       }
     }
     return null;
   }
 
+  // Videonun kapak görseli üstteyse, aynı yerdeki videoyu tercih et.
+  function preferVideo(node) {
+    if (node.tagName === 'VIDEO') return node;
+    const r = node.getBoundingClientRect();
+    const scope = node.parentElement?.parentElement?.parentElement;
+    for (const v of scope?.querySelectorAll('video') || []) {
+      const vr = v.getBoundingClientRect();
+      if (Math.abs(vr.left - r.left) < 8 && Math.abs(vr.top - r.top) < 8 && Math.abs(vr.width - r.width) < 16) return v;
+    }
+    return node;
+  }
+
+  function timeAgo(ts) {
+    if (!ts) return '';
+    const s = Math.max(0, Date.now() / 1000 - ts);
+    if (s < 3600) return `${Math.max(1, Math.round(s / 60))} dk`;
+    if (s < 86400) return `${Math.round(s / 3600)} sa`;
+    if (s < 86400 * 30) return `${Math.round(s / 86400)} g`;
+    return new Date(ts * 1000).toLocaleDateString('tr-TR');
+  }
+
   function showPreview(node, startScale = 1) {
     hidePreview();
     const token = ++hover.token;
-    hover.node = node;
+    hover.candidate = null;
 
     const dom = domMedia(node);
-    const stage = el('div', { class: 'igsz-pv-stage' });
-    const info = el('div', { class: 'igsz-pv-info', text: 'Yükleniyor…' });
-    const box = el('div', { id: 'igsz-preview' }, [stage, info]);
+    const frame = el('div', { class: 'igsz-pv-frame igsz-pv-loading' });
+    const head = el('div', { class: 'igsz-pv-head igsz-glass' });
+    const info = el('div', { class: 'igsz-pv-info igsz-glass', text: 'Yükleniyor…' });
+    const box = el('div', { id: 'igsz-preview' }, [frame, head, info]);
     document.body.append(box);
 
-    const pv = { box, stage, info, node, list: null, index: 0, story: false, media: null, mediaEl: null, scale: startScale, paused: false };
+    const pv = {
+      box, frame, head, info, node, rect: rectOf(node), token,
+      list: null, index: 0, story: false, note: null, loaders: null, loading: false,
+      media: null, mediaEl: null, scale: startScale, paused: false, pausedVideo: null, wheelAcc: 0, wheelAt: 0
+    };
     hover.preview = pv;
+    head.hidden = true;
+    pv.expectSeq = Boolean(isStoryPage() || highlightFor(node) || storyRingUser(node) || isProfilePic(node));
 
-    // Hikaye sayfasında Instagram'ın hikayeyi geçmesini durdur.
+    // Hikaye sayfasında Instagram'ın hikayeyi geçmesini, akışta da arkadaki videonun çalmasını durdur.
     if (isStoryPage()) pv.paused = pauseStory(node);
+    if (node.tagName === 'VIDEO' && !node.paused) {
+      node.pause();
+      pv.pausedVideo = node;
+    }
 
-    // Yüksek çözünürlük gelene kadar sayfadaki sürümü göster.
+    // Yüksek çözünürlük gelene kadar sayfadaki sürümü (video ise o anki kareyi) göster.
     if (usable(dom)) renderPreviewMedia(pv, dom);
+    else if (node.tagName === 'VIDEO') showVideoFrame(pv, node);
 
     resolveNode(node).then(
       (res) => {
-        if (token !== hover.token) return;
+        if (hover.preview !== pv) return;
         pv.list = res.list;
         pv.index = res.index;
         pv.story = res.story;
         pv.note = res.note || null;
+        pv.loaders = res.loaders || null;
         renderPreviewMedia(pv, res.list[res.index]);
+        prefetch(pv);
       },
       (err) => {
-        if (token !== hover.token) return;
-        if (pv.media) updatePreviewInfo(pv, err.message);
-        else {
-          info.textContent = err.message || String(err);
-          info.classList.add('igsz-error');
-        }
+        if (hover.preview !== pv) return;
+        updatePreviewInfo(pv, err.message || String(err));
       }
     );
+  }
+
+  function showVideoFrame(pv, video) {
+    if (!video.videoWidth) return;
+    const c = el('canvas', { class: 'igsz-pv-media' });
+    c.width = video.videoWidth;
+    c.height = video.videoHeight;
+    try {
+      c.getContext('2d').drawImage(video, 0, 0);
+    } catch {
+      return;
+    }
+    pv.media = { type: 'frame', w: c.width, h: c.height };
+    pv.mediaEl = c;
+    pv.frame.replaceChildren(c);
+    pv.frame.classList.remove('igsz-pv-loading');
+    layoutPreview(pv);
   }
 
   function renderPreviewMedia(pv, media) {
     if (!media) return;
     pv.media = media;
     const node = createMediaElement(media, 'igsz-pv-media');
-    pv.mediaEl?.tagName === 'VIDEO' && pv.mediaEl.pause();
+    if (pv.mediaEl?.tagName === 'VIDEO') pv.mediaEl.pause();
     pv.mediaEl = node;
-    pv.stage.replaceChildren(node);
-    onMediaReady(node, () => layoutPreview(pv));
-    node.addEventListener('error', () => updatePreviewInfo(pv, 'Medya yüklenemedi'));
+    // Yeni medya yüklenene kadar eskisi görünsün (tekerlekle hızlı geçişte titreme olmasın).
+    onMediaReady(node, () => {
+      if (pv.mediaEl !== node) return;
+      pv.frame.replaceChildren(node);
+      pv.frame.classList.remove('igsz-pv-loading');
+      layoutPreview(pv);
+    });
+    node.addEventListener('error', () => pv.mediaEl === node && updatePreviewInfo(pv, 'Medya yüklenemedi'));
     updatePreviewInfo(pv);
   }
 
-  function updatePreviewInfo(pv, error) {
+  function updatePreviewInfo(pv, error, status) {
+    const m = pv.media;
+    const headParts = [];
+    if (m?.owner) headParts.push(`@${m.owner}`);
+    if (m?.label) headParts.push(m.label);
+    if (m?.taken_at) headParts.push(timeAgo(m.taken_at));
+    pv.head.textContent = headParts.join('  ·  ');
+    pv.head.hidden = !headParts.length;
+
     const parts = [];
-    if (pv.list && pv.list.length > 1) parts.push(`${pv.index + 1}/${pv.list.length}`);
+    if (pv.list && (pv.list.length > 1 || pv.loaders?.length)) parts.push(`${pv.index + 1}/${pv.list.length}${pv.loaders?.length ? '+' : ''}`);
     if (pv.scale > 1.01) parts.push(`${Math.round(pv.scale * 100)}%`);
-    if (pv.note && !error) parts.push(pv.note);
-    parts.push(error || 'W büyüt · Q küçült · S indir' + (pv.list?.length > 1 ? ' · A/D önceki/sonraki' : '') + ' · F tam ekran' + (pv.media?.type === 'video' ? ' · M ses' : ''));
+    if (status) parts.push(status);
+    else if (pv.note && !error) parts.push(pv.note);
+    const canStep = pv.list && (pv.list.length > 1 || pv.loaders?.length);
+    parts.push(error || (canStep ? 'Tekerlek / A·D: geçiş · ' : '') + 'W büyüt · Q küçült · S indir · F tam ekran' + (m?.type === 'video' ? ' · M ses' : ''));
     pv.info.textContent = parts.join('  ·  ');
     pv.info.classList.toggle('igsz-error', Boolean(error));
   }
@@ -693,25 +865,19 @@
     if (!nw || !nh) return;
     const W = innerWidth;
     const H = innerHeight;
-    const fit = Math.min((W * 0.96) / nw, (H * 0.96) / nh);
+    const fit = Math.min((W * 0.9) / nw, (H * 0.86) / nh);
     const w = nw * fit * pv.scale;
     const h = nh * fit * pv.scale;
 
-    // Büyütülmüşse, fare kaynak öğenin neresindeyse önizlemenin orası görünsün.
-    let px = 0.5;
-    let py = 0.5;
-    if (pv.node?.isConnected) {
-      const r = pv.node.getBoundingClientRect();
-      if (r.width && r.height) {
-        px = Math.min(1, Math.max(0, (mouse.x - r.left) / r.width));
-        py = Math.min(1, Math.max(0, (mouse.y - r.top) / r.height));
-      }
-    }
+    // Büyütülmüşse, fare kaynak alanın neresindeyse önizlemenin orası görünsün.
+    const r = pv.rect;
+    const px = r.width ? Math.min(1, Math.max(0, (mouse.x - r.left) / r.width)) : 0.5;
+    const py = r.height ? Math.min(1, Math.max(0, (mouse.y - r.top) / r.height)) : 0.5;
     const x = w <= W ? (W - w) / 2 : -(w - W) * px;
     const y = h <= H ? (H - h) / 2 : -(h - H) * py;
-    node.style.width = `${w}px`;
-    node.style.height = `${h}px`;
-    node.style.transform = `translate(${x}px, ${y}px)`;
+    pv.frame.style.width = `${w}px`;
+    pv.frame.style.height = `${h}px`;
+    pv.frame.style.transform = `translate(${x}px, ${y}px)`;
   }
 
   function zoomPreview(factor) {
@@ -722,65 +888,162 @@
     updatePreviewInfo(pv);
   }
 
-  function stepPreview(dir) {
+  // Sona yaklaşınca sıradaki parçayı arka planda yükle, sonraki görseli önden indir.
+  function prefetch(pv) {
+    const next = pv.list?.[pv.index + 1];
+    if (next?.type === 'image') new Image().src = next.url;
+    if (pv.loaders?.length && !pv.loading && pv.index >= pv.list.length - 2) loadMore(pv);
+  }
+
+  async function loadMore(pv) {
+    if (pv.loading) return pv.loading;
+    pv.loading = (async () => {
+      try {
+        const more = await takeMore(pv.loaders);
+        pv.list.push(...more);
+      } catch (err) {
+        console.warn('[Story Zoom] Sonraki hikayeler alınamadı:', err);
+      } finally {
+        pv.loading = false;
+      }
+    })();
+    return pv.loading;
+  }
+
+  async function stepPreview(dir) {
     const pv = hover.preview;
-    if (!pv?.list || pv.list.length < 2) return false;
-    const next = pv.index + dir;
+    if (!pv?.list) return false;
+    let next = pv.index + dir;
+    if (next >= pv.list.length && pv.loaders?.length) {
+      updatePreviewInfo(pv, null, 'Sıradaki hikayeler yükleniyor…');
+      await loadMore(pv);
+      if (hover.preview !== pv) return true;
+      next = pv.index + dir;
+    }
     if (next < 0 || next >= pv.list.length) {
-      toast(dir > 0 ? 'Son öğe' : 'İlk öğe');
+      updatePreviewInfo(pv, null, dir > 0 ? 'Hepsi bu kadar' : 'En baştasın');
       return true;
     }
     pv.index = next;
     pv.scale = 1;
     renderPreviewMedia(pv, pv.list[next]);
+    prefetch(pv);
     return true;
   }
 
-  // suppress: fare bu öğeden ayrılana kadar tekrar açma (Esc, tıklama, kaydırma sonrası).
+  // suppress: fare bu alandan çıkana kadar tekrar açma (Esc, tıklama, kaydırma sonrası).
   function hidePreview(suppress = false) {
     clearTimeout(hover.timer);
-    hover.token++;
+    clearTimeout(hover.closeTimer);
+    hover.candidate = null;
     const pv = hover.preview;
     hover.preview = null;
-    hover.node = null;
     if (!pv) return;
-    if (suppress) hover.suppress = pv.node;
+    if (suppress) hover.suppressRect = pv.node?.isConnected ? rectOf(pv.node) : pv.rect;
     if (pv.mediaEl?.tagName === 'VIDEO') {
       pv.mediaEl.pause();
       pv.mediaEl.removeAttribute('src');
       pv.mediaEl.load();
     }
-    pv.box.remove();
+    pv.box.classList.add('igsz-closing');
+    setTimeout(() => pv.box.remove(), 120);
     if (pv.paused) resumeStory(pv.node);
+    if (pv.pausedVideo?.isConnected) pv.pausedVideo.play().catch(() => {});
   }
 
   function onMouseMove(e) {
+    // Kaydırma sonrası tarayıcının gönderdiği sahte olaylar: konum değişmemişse yok say.
+    if (e.clientX === mouse.x && e.clientY === mouse.y) return;
     mouse.x = e.clientX;
     mouse.y = e.clientY;
     if (onMouseMove.raf) return;
     onMouseMove.raf = requestAnimationFrame(() => {
       onMouseMove.raf = 0;
       if (viewer) return;
+      const pv = hover.preview;
+
+      if (pv) {
+        // Açık önizleme: fare kaynak alanda kaldıkça açık kalır, başka hiçbir şey açılmaz.
+        if (pv.node?.isConnected) {
+          const r = rectOf(pv.node);
+          if (r.width && r.height) pv.rect = r;
+        }
+        if (contains(pv.rect, mouse.x, mouse.y, 10)) {
+          clearTimeout(hover.closeTimer);
+          hover.closeTimer = 0;
+          layoutPreview(pv);
+        } else if (!hover.closeTimer) {
+          hover.closeTimer = setTimeout(() => {
+            hover.closeTimer = 0;
+            if (hover.preview === pv && !contains(pv.rect, mouse.x, mouse.y, 10)) hidePreview();
+          }, CLOSE_DELAY);
+        }
+        return;
+      }
+
+      if (hover.suppressRect && !contains(hover.suppressRect, mouse.x, mouse.y)) hover.suppressRect = null;
+      if (!hoverEnabled || Date.now() < hover.quietUntil) return;
+
       const node = mediaAtPoint(mouse.x, mouse.y);
-      if (node !== hover.suppress) hover.suppress = null;
-      if (hover.preview) {
-        if (node === hover.preview.node) layoutPreview(hover.preview);
-        else hidePreview();
-      }
-      if (!hoverEnabled || hover.preview || node === hover.node || (node && node === hover.suppress)) return;
+      if (node && hover.suppressRect && contains(hover.suppressRect, mouse.x, mouse.y)) return;
+      if (node === hover.candidate) return;
       clearTimeout(hover.timer);
-      hover.node = node;
-      if (node) {
-        hover.timer = setTimeout(() => {
-          if (hover.node === node && !viewer && mediaAtPoint(mouse.x, mouse.y) === node) showPreview(node);
-        }, HOVER_DELAY);
-      }
+      hover.candidate = node;
+      if (!node) return;
+      const rect = rectOf(node);
+      hover.timer = setTimeout(() => {
+        if (hover.candidate !== node || hover.preview || viewer || Date.now() < hover.quietUntil) return;
+        // Bu arada fare başka yere gittiyse ya da sayfa kaydıysa açma.
+        if (!contains(rect, mouse.x, mouse.y)) return;
+        const now = node.isConnected ? rectOf(node) : null;
+        if (!now || Math.abs(now.top - rect.top) > 4 || Math.abs(now.left - rect.left) > 4) return;
+        showPreview(node);
+      }, HOVER_DELAY);
     });
   }
 
+  function onScroll() {
+    hover.quietUntil = Date.now() + SCROLL_QUIET;
+    clearTimeout(hover.timer);
+    hover.candidate = null;
+    const pv = hover.preview;
+    if (!pv) return;
+    // Sadece kaynak gerçekten yer değiştirdiyse kapat (Instagram'ın iç kaydırmaları sayılmaz).
+    if (pv.node?.isConnected) {
+      const r = rectOf(pv.node);
+      if (Math.abs(r.top - pv.rect.top) > 30 || Math.abs(r.left - pv.rect.left) > 30) hidePreview(true);
+    }
+  }
+
+  // Tekerlek: önizlemede geçilecek bir şey varsa hikayeler/fotoğraflar arasında gezinir,
+  // yoksa önizlemeyi kapatır ve sayfa normal kayar.
+  function onWheel(e) {
+    const pv = hover.preview;
+    if (!pv || viewer || e.ctrlKey) return;
+    const canStep = pv.list && (pv.list.length > 1 || pv.loaders?.length);
+    if (!canStep) {
+      // Hikaye dizisi hâlâ yükleniyorsa tekerleği yut; değilse kapat ve sayfa kaysın.
+      if (!pv.list && pv.expectSeq) e.preventDefault();
+      else hidePreview(true);
+      return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    const delta = e.deltaMode === 1 ? e.deltaY * 40 : e.deltaY;
+    pv.wheelAcc += delta;
+    const now = Date.now();
+    if (Math.abs(pv.wheelAcc) >= 50 && now - pv.wheelAt > 160) {
+      const dir = pv.wheelAcc > 0 ? 1 : -1;
+      pv.wheelAcc = 0;
+      pv.wheelAt = now;
+      stepPreview(dir);
+    }
+  }
+
   document.addEventListener('mousemove', onMouseMove, { passive: true });
-  document.addEventListener('mousedown', () => hover.preview && hidePreview(true), true);
-  window.addEventListener('scroll', () => hover.preview && hidePreview(true), { capture: true, passive: true });
+  document.addEventListener('mousedown', (e) => hover.preview && e.button !== 1 && hidePreview(true), true);
+  window.addEventListener('wheel', onWheel, { capture: true, passive: false });
+  window.addEventListener('scroll', onScroll, { capture: true, passive: true });
   window.addEventListener('blur', () => hidePreview());
   window.addEventListener('resize', () => hover.preview && layoutPreview(hover.preview));
 
@@ -1160,7 +1423,7 @@
           case 'a':
           case 'd': {
             const dir = key === 'd' ? 1 : -1;
-            if (pv?.list?.length > 1) return () => stepPreview(dir);
+            if (pv?.list && (pv.list.length > 1 || pv.loaders?.length)) return () => stepPreview(dir);
             return isStoryPage() ? () => navigateStory(dir) : null;
           }
           default:

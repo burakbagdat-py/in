@@ -5,7 +5,7 @@
   if (window.__igszLoaded) return;
   window.__igszLoaded = true;
 
-  const VERSION = '2.2.0';
+  const VERSION = '2.3.0';
 
   // Instagram web istemcisinin kendi kullandığı uygulama kimliği.
   const IG_APP_ID = '936619743392459';
@@ -178,6 +178,14 @@
             firstError ||= err;
           }
         }
+        // Son yedek: kendi hikaye tepsimiz (takip edilen kişiler, öğeleriyle birlikte gelebilir).
+        if (!String(reelId).startsWith('highlight:')) {
+          try {
+            const json = await cached('tray-raw', () => igApi('/api/v1/feed/reels_tray/'));
+            const entry = (json?.tray || []).find((t) => String(t.user?.pk ?? t.id) === String(reelId));
+            if (entry?.items?.length) return entry;
+          } catch {}
+        }
         if (firstError) throw firstError;
         return null;
       },
@@ -348,11 +356,30 @@
       if (parts.length === 1 && !RESERVED.has(parts[0])) return parts[0];
       if (parts[0] === 'stories' && parts[1] && parts[1] !== 'highlights') return parts[1];
     }
+    // Profil sayfasının başlığındaki avatar: kullanıcı adı adres çubuğunda.
+    const owner = profileOwnerFromPath();
+    if (owner && node.closest('header')) return owner;
+    // Son çare: açıklama metni ("kullanici adlı kişinin profil fotoğrafı", "user's profile picture").
     const m = (node.getAttribute('alt') || '').match(/^([A-Za-z0-9._]{1,30})(?:'s|’s|\s)/);
-    return m ? m[1] : null;
+    if (m && !NOT_USERNAMES.test(m[1])) return m[1];
+    return owner && isAvatarShape(node) ? owner : null;
   }
 
-  const isProfilePic = (node) => node.tagName === 'IMG' && /profil|profile/i.test(node.getAttribute('alt') || '');
+  const NOT_USERNAMES = /^(profil|profile|photo|fotoğraf|foto|image|resim|avatar|change|değiştir|story|hikaye)$/i;
+
+  // Yuvarlak, kare bir görsel = avatar (açıklama metni olmasa bile).
+  function isAvatarShape(node) {
+    if (node.tagName !== 'IMG') return false;
+    const r = node.getBoundingClientRect();
+    if (!r.width || r.width > 220 || Math.abs(r.width - r.height) > 3) return false;
+    for (let n = node, i = 0; n && i < 3; n = n.parentElement, i++) {
+      const br = parseFloat(getComputedStyle(n).borderTopLeftRadius) || 0;
+      if (br >= r.width * 0.4) return true;
+    }
+    return false;
+  }
+
+  const isProfilePic = (node) => node.tagName === 'IMG' && (/profil|profile/i.test(node.getAttribute('alt') || '') || isAvatarShape(node));
 
   function shortcodeFor(node) {
     const re = /\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]{5,})/;
@@ -418,7 +445,7 @@
 
   function getReelsTray() {
     return cached('tray', async () => {
-      const json = await igApi('/api/v1/feed/reels_tray/');
+      const json = await cached('tray-raw', () => igApi('/api/v1/feed/reels_tray/'));
       return (json?.tray || []).filter((t) => t.user?.username).map((t) => ({ id: String(t.user.pk ?? t.id), username: t.user.username }));
     });
   }
@@ -470,6 +497,20 @@
     return [];
   }
 
+  // Gerçek yüksek çözünürlüklü profil resmi (genelde 1080 px). web_profile_info'daki "hd" sadece 320 px.
+  async function getHdProfilePic(user, username) {
+    try {
+      const json = await cached(`uinfo:${user.id}`, () => igApi(`/api/v1/users/${encodeURIComponent(user.id)}/info/`));
+      const u = json?.user;
+      const best = u?.hd_profile_pic_url_info?.url ? u.hd_profile_pic_url_info : largest(u?.hd_profile_pic_versions);
+      if (best?.url) return { type: 'image', url: best.url, w: best.width, h: best.height, id: 'profil', owner: username, label: 'Profil resmi' };
+    } catch (err) {
+      console.warn('[Story Zoom] HD profil resmi alınamadı:', err);
+    }
+    const url = user.profile_pic_url_hd || user.profile_pic_url;
+    return url ? { type: 'image', url, id: 'profil', owner: username, label: 'Profil resmi' } : null;
+  }
+
   async function resolveUserSequence(username) {
     const user = await getProfile(username);
     const loaders = [highlightsLoader({ id: user.id, username }), trayLoader(new Set([username]))];
@@ -485,14 +526,11 @@
       console.warn('[Story Zoom] Hikaye alınamadı:', err);
       note = `Hikaye alınamadı (${err.message})`;
     }
+    // Hikaye yoksa: yüksek kaliteli profil resmi (tekerlekle öne çıkanlara geçilir).
     if (!list.length) {
-      list = await takeMore(loaders, true);
-      if (list.length) note ||= 'Aktif hikaye yok, öne çıkanlar gösteriliyor';
-    }
-    if (!list.length) {
-      const url = user.profile_pic_url_hd || user.profile_pic_url;
-      if (url) list = [{ type: 'image', url, id: 'profil', owner: username, label: 'Profil resmi' }];
-      note ||= 'Aktif hikaye ve öne çıkan yok';
+      const pic = await getHdProfilePic(user, username);
+      if (pic) list = [pic];
+      note ||= 'Aktif hikaye yok · tekerlek: öne çıkanlar';
     }
     if (!list.length) throw new Error(note || 'Bu kişi için bir şey bulunamadı');
     return { list, index: Math.min(index, list.length - 1), story: true, note, loaders };
@@ -538,13 +576,20 @@
 
       // Avatar ya da hikaye halkası: hikayeler → öne çıkanlar → (yoksa) HD profil resmi.
       const user = node && (storyRingUser(node) || (isProfilePic(node) ? avatarUser(node) : null));
-      if (user) return await resolveUserSequence(user);
+      if (user) {
+        try {
+          return await resolveUserSequence(user);
+        } catch (err) {
+          throw new Error(`@${user} alınamadı: ${err.message}`);
+        }
+      }
+      if (node && isProfilePic(node)) throw new Error('Bu profil resminin kime ait olduğu bulunamadı');
 
       const code = node && shortcodeFor(node);
       if (code) return await resolvePost(code, dom);
     } catch (err) {
       console.warn('[Story Zoom] API ile alınamadı, sayfadaki medya kullanılıyor:', err);
-      if (!usable(dom)) throw err;
+      if (!usable(dom) || (node && isProfilePic(node))) throw err;
     }
 
     if (usable(dom)) return { list: [{ ...dom, id: String(Date.now()), owner: 'instagram' }], index: 0, story: false };
@@ -712,7 +757,7 @@
     const r = node.getBoundingClientRect();
     if (!contains(r, x, y)) return false;
     if (r.width >= MIN_MEDIA && r.height >= MIN_MEDIA) return true;
-    return r.width >= 28 && r.height >= 28 && Boolean(highlightFor(node) || storyRingUser(node));
+    return r.width >= 28 && r.height >= 28 && Boolean(highlightFor(node) || storyRingUser(node) || (isProfilePic(node) && avatarUser(node)));
   }
 
   function mediaAtPoint(x, y) {
@@ -783,7 +828,8 @@
     }
 
     // Yüksek çözünürlük gelene kadar sayfadaki sürümü (video ise o anki kareyi) göster.
-    if (usable(dom)) renderPreviewMedia(pv, dom);
+    // Avatar gibi küçük görselleri büyütüp bulanık gösterme; yükleme simgesi yeter.
+    if (usable(dom) && !isProfilePic(node) && (node.naturalWidth || 0) >= 400) renderPreviewMedia(pv, dom);
     else if (node.tagName === 'VIDEO') showVideoFrame(pv, node);
 
     resolveNode(node).then(
@@ -865,7 +911,8 @@
     if (!nw || !nh) return;
     const W = innerWidth;
     const H = innerHeight;
-    const fit = Math.min((W * 0.9) / nw, (H * 0.86) / nh);
+    // Küçük görselleri en fazla 2 katına büyüt (bulanık görünmesin).
+    const fit = Math.min((W * 0.9) / nw, (H * 0.86) / nh, 2);
     const w = nw * fit * pv.scale;
     const h = nh * fit * pv.scale;
 

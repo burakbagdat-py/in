@@ -5,13 +5,14 @@
   if (window.__igszLoaded) return;
   window.__igszLoaded = true;
 
-  const VERSION = '2.3.0';
+  const VERSION = '2.4.0';
 
   // Instagram web istemcisinin kendi kullandığı uygulama kimliği.
   const IG_APP_ID = '936619743392459';
   const UI_SELECTOR = '#igsz-root, #igsz-overlay, #igsz-preview, #igsz-toast';
   const CACHE_MS = 60_000;
-  const HOVER_DELAY = 250;
+  const HOVER_DELAY = 500; // fare bu kadar süre neredeyse hiç kıpırdamadan durmalı
+  const DWELL_RADIUS = 6;
   const MIN_MEDIA = 100; // Bundan küçük görseller (avatarlar vb.) sadece hikaye halkasıysa açılır.
 
   // ---------------------------------------------------------------------------
@@ -117,89 +118,136 @@
     }
   }
 
-  async function igApi(path) {
-    const res = await fetch(path, {
-      credentials: 'include',
-      headers: {
-        Accept: 'application/json',
-        'X-IG-App-ID': IG_APP_ID,
-        'X-CSRFToken': csrfToken(),
-        'X-Requested-With': 'XMLHttpRequest',
-        'X-ASBD-ID': '129477',
-        // Instagram web istemcisi bu başlığı her istekte gönderir; bazı uç noktalar onsuz boş döner.
-        'X-IG-WWW-Claim': wwwClaim()
-      }
-    });
-    if (res.status === 401 || res.status === 403) throw new Error('Instagram oturumu bulunamadı, giriş yapıp sayfayı yenileyin');
-    if (res.status === 429) throw new Error('Instagram çok fazla istek dedi, biraz bekleyip tekrar deneyin');
-    if (!res.ok) throw new Error(`Instagram API hatası (${res.status})`);
-    return res.json();
+  // --- İstek trafiği: Instagram'ı "çok fazla istek" sınırına sokmamak için ---
+  //  - İstekler tek tek ve aralarında en az MIN_GAP ms olacak şekilde sıraya alınır.
+  //  - 429 gelirse tüm istekler bir süre durdurulur (her tekrarda süre uzar).
+  //  - Kapatılan önizlemenin sırada bekleyen istekleri hiç gönderilmez (epoch).
+  //  - Kullanıcı kimlikleri ve profil bilgileri tarayıcıda kalıcı saklanır.
+  const MIN_GAP = 450;
+  const net = { chain: Promise.resolve(), last: 0, blockedUntil: 0, strikes: 0, epoch: 0 };
+
+  class Cancelled extends Error {
+    constructor() {
+      super('İptal edildi');
+      this.cancelled = true;
+    }
   }
 
-  // Aynı isteği kısa süre içinde tekrar atmamak için basit önbellek.
+  function rateLimitMessage() {
+    const secs = Math.ceil((net.blockedUntil - Date.now()) / 1000);
+    return `Instagram çok fazla istek dedi; ${secs} sn bekleniyor (önbellektekiler yine açılır)`;
+  }
+
+  function igApi(path, { keep = false } = {}) {
+    const epoch = net.epoch;
+    const run = async () => {
+      if (!keep && epoch !== net.epoch) throw new Cancelled();
+      if (Date.now() < net.blockedUntil) throw new Error(rateLimitMessage());
+      const wait = net.last + MIN_GAP - Date.now();
+      if (wait > 0) await sleep(wait);
+      if (!keep && epoch !== net.epoch) throw new Cancelled();
+      net.last = Date.now();
+      const res = await fetch(path, {
+        credentials: 'include',
+        headers: {
+          Accept: 'application/json',
+          'X-IG-App-ID': IG_APP_ID,
+          'X-CSRFToken': csrfToken(),
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-ASBD-ID': '129477',
+          // Instagram web istemcisi bu başlığı her istekte gönderir; bazı uç noktalar onsuz boş döner.
+          'X-IG-WWW-Claim': wwwClaim()
+        }
+      });
+      if (res.status === 429) {
+        net.strikes++;
+        net.blockedUntil = Date.now() + Math.min(10 * 60_000, 60_000 * 2 ** (net.strikes - 1));
+        throw new Error(rateLimitMessage());
+      }
+      if (res.status === 401 || res.status === 403) throw new Error('Instagram oturumu bulunamadı, giriş yapıp sayfayı yenileyin');
+      if (!res.ok) throw new Error(`Instagram API hatası (${res.status})`);
+      net.strikes = 0;
+      return res.json();
+    };
+    const p = net.chain.then(run, run);
+    net.chain = p.catch(() => {});
+    return p;
+  }
+
+  // Bellek içi önbellek (anahtar başına süre).
   const apiCache = new Map();
-  function cached(key, loader, force = false) {
+  function cached(key, loader, force = false, ttl = CACHE_MS) {
     const hit = apiCache.get(key);
-    if (!force && hit && Date.now() - hit.time < CACHE_MS) return hit.promise;
+    if (!force && hit && Date.now() - hit.time < ttl) return hit.promise;
     const promise = loader();
     apiCache.set(key, { time: Date.now(), promise });
     promise.catch(() => apiCache.delete(key));
     return promise;
   }
 
+  // Kalıcı önbellek (sayfa yenilense de kalır).
+  const store = {
+    get(key) {
+      try {
+        const o = JSON.parse(localStorage.getItem(`igsz:${key}`));
+        return o && o.e > Date.now() ? o.v : null;
+      } catch {
+        return null;
+      }
+    },
+    set(key, value, ttl) {
+      try {
+        localStorage.setItem(`igsz:${key}`, JSON.stringify({ v: value, e: Date.now() + ttl }));
+      } catch {}
+    }
+  };
+
+  const HOUR = 3600_000;
+
   function getProfile(username) {
+    const saved = store.get(`u:${username}`);
+    if (saved) return Promise.resolve(saved);
     return cached(`profile:${username}`, async () => {
       const json = await igApi(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`);
-      const user = json?.data?.user;
-      if (!user?.id) throw new Error('Kullanıcı bulunamadı');
+      const u = json?.data?.user;
+      if (!u?.id) throw new Error('Kullanıcı bulunamadı');
+      const user = { id: String(u.id), username: u.username || username, profile_pic_url_hd: u.profile_pic_url_hd, profile_pic_url: u.profile_pic_url };
+      store.set(`u:${username}`, user, 24 * HOUR);
       return user;
     });
   }
 
+  // Hikayeler. Ana uç nokta boş dönerse "hikaye yok" demektir; yedeklere sadece hata olursa gidilir.
   function getReel(reelId, force = false) {
     return cached(
       `reel:${reelId}`,
       async () => {
-        let firstError = null;
         try {
           const json = await igApi(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelId)}`);
-          const reel = json?.reels?.[reelId] || json?.reels_media?.find((r) => String(r.id) === String(reelId)) || json?.reels_media?.[0];
-          if (reel?.items?.length) return reel;
+          return json?.reels?.[reelId] || json?.reels_media?.find((r) => String(r.id) === String(reelId)) || json?.reels_media?.[0] || null;
         } catch (err) {
-          firstError = err;
+          if (err.cancelled || Date.now() < net.blockedUntil || String(reelId).startsWith('highlight:')) throw err;
+          const json = await igApi(`/api/v1/feed/user/${encodeURIComponent(reelId)}/story/`);
+          return json?.reel || json?.story || null;
         }
-        // Yedek uç nokta (sadece kullanıcı hikayeleri için, öne çıkanlar için değil).
-        if (!String(reelId).startsWith('highlight:')) {
-          try {
-            const json = await igApi(`/api/v1/feed/user/${encodeURIComponent(reelId)}/story/`);
-            const reel = json?.reel || json?.story;
-            if (reel?.items?.length) return reel;
-          } catch (err) {
-            firstError ||= err;
-          }
-        }
-        // Son yedek: kendi hikaye tepsimiz (takip edilen kişiler, öğeleriyle birlikte gelebilir).
-        if (!String(reelId).startsWith('highlight:')) {
-          try {
-            const json = await cached('tray-raw', () => igApi('/api/v1/feed/reels_tray/'));
-            const entry = (json?.tray || []).find((t) => String(t.user?.pk ?? t.id) === String(reelId));
-            if (entry?.items?.length) return entry;
-          } catch {}
-        }
-        if (firstError) throw firstError;
-        return null;
       },
-      force
+      force,
+      3 * 60_000
     );
   }
 
   function getMediaInfo(pk) {
-    return cached(`media:${pk}`, async () => {
-      const json = await igApi(`/api/v1/media/${pk}/info/`);
-      const item = json?.items?.[0];
-      if (!item) throw new Error('Gönderi bulunamadı');
-      return item;
-    });
+    return cached(
+      `media:${pk}`,
+      async () => {
+        const json = await igApi(`/api/v1/media/${pk}/info/`);
+        const item = json?.items?.[0];
+        if (!item) throw new Error('Gönderi bulunamadı');
+        return item;
+      },
+      false,
+      30 * 60_000
+    );
   }
 
   const SHORTCODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
@@ -434,20 +482,24 @@
   // "loaders" kuyruğu: sıradaki parça gerektiğinde (tekerlek / D) yüklenir, böylece geçiş sonsuz olur.
 
   function getHighlightsTray(userId) {
+    const saved = store.get(`hl:${userId}`);
+    if (saved) return Promise.resolve(saved);
     return cached(`hl:${userId}`, async () => {
       const json = await igApi(`/api/v1/highlights/${encodeURIComponent(userId)}/highlights_tray/`);
-      return (json?.tray || []).map((h) => ({
+      const tray = (json?.tray || []).map((h) => ({
         id: String(h.id).startsWith('highlight:') ? String(h.id) : `highlight:${h.id}`,
         title: h.title || ''
       }));
+      store.set(`hl:${userId}`, tray, HOUR);
+      return tray;
     });
   }
 
   function getReelsTray() {
     return cached('tray', async () => {
-      const json = await cached('tray-raw', () => igApi('/api/v1/feed/reels_tray/'));
+      const json = await igApi('/api/v1/feed/reels_tray/');
       return (json?.tray || []).filter((t) => t.user?.username).map((t) => ({ id: String(t.user.pk ?? t.id), username: t.user.username }));
-    });
+    }, false, 10 * 60_000);
   }
 
   function reelToMedia(reel, owner, label) {
@@ -499,16 +551,23 @@
 
   // Gerçek yüksek çözünürlüklü profil resmi (genelde 1080 px). web_profile_info'daki "hd" sadece 320 px.
   async function getHdProfilePic(user, username) {
+    const make = (url, w, h, label = 'Profil resmi') => ({ type: 'image', url, w, h, id: 'profil', owner: username, label });
+    const saved = store.get(`hd:${user.id}`);
+    if (saved) return make(saved.url, saved.w, saved.h);
     try {
       const json = await cached(`uinfo:${user.id}`, () => igApi(`/api/v1/users/${encodeURIComponent(user.id)}/info/`));
       const u = json?.user;
       const best = u?.hd_profile_pic_url_info?.url ? u.hd_profile_pic_url_info : largest(u?.hd_profile_pic_versions);
-      if (best?.url) return { type: 'image', url: best.url, w: best.width, h: best.height, id: 'profil', owner: username, label: 'Profil resmi' };
+      if (best?.url) {
+        store.set(`hd:${user.id}`, { url: best.url, w: best.width, h: best.height }, 6 * HOUR);
+        return make(best.url, best.width, best.height);
+      }
     } catch (err) {
+      if (err.cancelled) throw err;
       console.warn('[Story Zoom] HD profil resmi alınamadı:', err);
     }
     const url = user.profile_pic_url_hd || user.profile_pic_url;
-    return url ? { type: 'image', url, id: 'profil', owner: username, label: 'Profil resmi' } : null;
+    return url ? make(url, 0, 0, 'Profil resmi (düşük kalite, HD alınamadı)') : null;
   }
 
   async function resolveUserSequence(username) {
@@ -523,6 +582,7 @@
       // İlk görülmemiş hikayeden başla.
       index = Math.max(0, (reel?.items || []).findIndex((it) => reel.seen && it.taken_at > reel.seen));
     } catch (err) {
+      if (err.cancelled) throw err;
       console.warn('[Story Zoom] Hikaye alınamadı:', err);
       note = `Hikaye alınamadı (${err.message})`;
     }
@@ -580,6 +640,7 @@
         try {
           return await resolveUserSequence(user);
         } catch (err) {
+          if (err.cancelled) throw err;
           throw new Error(`@${user} alınamadı: ${err.message}`);
         }
       }
@@ -589,7 +650,8 @@
       if (code) return await resolvePost(code, dom);
     } catch (err) {
       console.warn('[Story Zoom] API ile alınamadı, sayfadaki medya kullanılıyor:', err);
-      if (!usable(dom) || (node && isProfilePic(node))) throw err;
+      if (err.cancelled || !usable(dom) || (node && isProfilePic(node))) throw err;
+      return { list: [{ ...dom, id: String(Date.now()), owner: 'instagram' }], index: 0, story: false, note: `Sayfadaki kalite gösteriliyor (${err.message})` };
     }
 
     if (usable(dom)) return { list: [{ ...dom, id: String(Date.now()), owner: 'instagram' }], index: 0, story: false };
@@ -744,7 +806,7 @@
   const CLOSE_DELAY = 140;
   const SCROLL_QUIET = 350;
   const mouse = { x: -1, y: -1 };
-  const hover = { candidate: null, timer: 0, closeTimer: 0, token: 0, preview: null, suppressRect: null, quietUntil: 0 };
+  const hover = { candidate: null, anchor: null, timer: 0, closeTimer: 0, token: 0, preview: null, suppressRect: null, quietUntil: 0 };
 
   const contains = (r, x, y, pad = 0) => x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad;
   const rectOf = (node) => {
@@ -844,7 +906,7 @@
         prefetch(pv);
       },
       (err) => {
-        if (hover.preview !== pv) return;
+        if (hover.preview !== pv || err.cancelled) return;
         updatePreviewInfo(pv, err.message || String(err));
       }
     );
@@ -939,7 +1001,7 @@
   function prefetch(pv) {
     const next = pv.list?.[pv.index + 1];
     if (next?.type === 'image') new Image().src = next.url;
-    if (pv.loaders?.length && !pv.loading && pv.index >= pv.list.length - 2) loadMore(pv);
+    if (pv.stepped && pv.loaders?.length && !pv.loading && pv.index >= pv.list.length - 2) loadMore(pv);
   }
 
   async function loadMore(pv) {
@@ -973,6 +1035,7 @@
     }
     pv.index = next;
     pv.scale = 1;
+    pv.stepped = true;
     renderPreviewMedia(pv, pv.list[next]);
     prefetch(pv);
     return true;
@@ -982,10 +1045,15 @@
   function hidePreview(suppress = false) {
     clearTimeout(hover.timer);
     clearTimeout(hover.closeTimer);
+    hover.closeTimer = 0;
     hover.candidate = null;
+    hover.anchor = null;
     const pv = hover.preview;
     hover.preview = null;
     if (!pv) return;
+    // Bu önizleme için sırada bekleyen istekler gönderilmesin; hemen ardından başka şey açılmasın.
+    net.epoch++;
+    hover.quietUntil = Date.now() + 300;
     if (suppress) hover.suppressRect = pv.node?.isConnected ? rectOf(pv.node) : pv.rect;
     if (pv.mediaEl?.tagName === 'VIDEO') {
       pv.mediaEl.pause();
@@ -1029,23 +1097,29 @@
       }
 
       if (hover.suppressRect && !contains(hover.suppressRect, mouse.x, mouse.y)) hover.suppressRect = null;
-      if (!hoverEnabled || Date.now() < hover.quietUntil) return;
+      if (!hoverEnabled) return;
 
       const node = mediaAtPoint(mouse.x, mouse.y);
       if (node && hover.suppressRect && contains(hover.suppressRect, mouse.x, mouse.y)) return;
-      if (node === hover.candidate) return;
+
+      // Fare durana kadar bekle: üstünden geçmek ya da kayma bir şey açmasın.
+      const moved = !hover.anchor || Math.hypot(mouse.x - hover.anchor.x, mouse.y - hover.anchor.y) > DWELL_RADIUS;
+      if (node === hover.candidate && !moved) return;
       clearTimeout(hover.timer);
       hover.candidate = node;
+      hover.anchor = { x: mouse.x, y: mouse.y };
       if (!node) return;
       const rect = rectOf(node);
+      const anchor = hover.anchor;
       hover.timer = setTimeout(() => {
-        if (hover.candidate !== node || hover.preview || viewer || Date.now() < hover.quietUntil) return;
-        // Bu arada fare başka yere gittiyse ya da sayfa kaydıysa açma.
-        if (!contains(rect, mouse.x, mouse.y)) return;
+        if (hover.candidate !== node || hover.anchor !== anchor || hover.preview || viewer || Date.now() < hover.quietUntil) return;
+        // Bu arada fare kıpırdadıysa, başka yere gittiyse ya da sayfa kaydıysa açma.
+        if (Math.hypot(mouse.x - anchor.x, mouse.y - anchor.y) > DWELL_RADIUS || !contains(rect, mouse.x, mouse.y)) return;
         const now = node.isConnected ? rectOf(node) : null;
         if (!now || Math.abs(now.top - rect.top) > 4 || Math.abs(now.left - rect.left) > 4) return;
+        if (mediaAtPoint(mouse.x, mouse.y) !== node) return;
         showPreview(node);
-      }, HOVER_DELAY);
+      }, Math.max(HOVER_DELAY, hover.quietUntil - Date.now() + 20));
     });
   }
 

@@ -42,7 +42,7 @@ schtasks /create /tn "Story Zoom guncelle" /sc hourly /f /tr "\"C:\Users\KULLANI
 
 ## Kullanım
 
-**Fareyle üzerine gelin**: akıştaki fotoğraf ve videolar, profil kılavuzu, reels, açık hikaye, hikaye halkaları,
+**Fareyi üzerinde yarım saniye sabit tutun** (üstünden geçmek bir şey açmaz): akıştaki fotoğraf ve videolar, profil kılavuzu, reels, açık hikaye, hikaye halkaları,
 profil fotoğrafları ve öne çıkanlar. Açılan her şey Aero (buzlu cam) görünümünde gelir; fareyi çekince kapanır.
 
 - **Profil fotoğrafı / hikaye halkası**: kişi hikaye paylaştıysa hikayesi açılır (görüldü olarak işaretlenmez).
@@ -88,6 +88,10 @@ Bir yere yazı yazarken (ör. hikayeye yanıt) tuşlar devre dışıdır.
 - Hiçbir veri üçüncü bir sunucuya gönderilmez.
 
 ## Sorun giderme
+
+- **"Instagram çok fazla istek dedi"**: eklenti istekleri tek tek ve aralıklı gönderir, profil bilgilerini ve
+  HD profil resimlerini tarayıcıda saklar. Yine de bu hata gelirse eklenti bir süre (1 dk, tekrarında daha uzun)
+  hiç istek göndermez; bu sırada önbellekte olanlar ve sayfadaki görseller açılmaya devam eder.
 
 - **Hiçbir şey açılmıyor**: Instagram sekmesini yenileyin. `F12` → **Console**'da `[Story Zoom] v… yüklendi`
   yazısı yoksa eklenti yüklenmemiştir; `brave://extensions`'ta açık olduğundan emin olun.

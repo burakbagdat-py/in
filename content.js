@@ -5,7 +5,7 @@
   if (window.__igszLoaded) return;
   window.__igszLoaded = true;
 
-  const VERSION = '2.4.0';
+  const VERSION = '2.5.0';
 
   // Instagram web istemcisinin kendi kullandığı uygulama kimliği.
   const IG_APP_ID = '936619743392459';
@@ -120,11 +120,12 @@
 
   // --- İstek trafiği: Instagram'ı "çok fazla istek" sınırına sokmamak için ---
   //  - İstekler tek tek ve aralarında en az MIN_GAP ms olacak şekilde sıraya alınır.
-  //  - 429 gelirse tüm istekler bir süre durdurulur (her tekrarda süre uzar).
+  //  - Instagram sınırı adres (uç nokta) başına koyar; 429 gelirse SADECE o adres bir süre
+  //    kullanılmaz, diğerleri ve yedek yollar çalışmaya devam eder.
   //  - Kapatılan önizlemenin sırada bekleyen istekleri hiç gönderilmez (epoch).
   //  - Kullanıcı kimlikleri ve profil bilgileri tarayıcıda kalıcı saklanır.
   const MIN_GAP = 450;
-  const net = { chain: Promise.resolve(), last: 0, blockedUntil: 0, strikes: 0, epoch: 0 };
+  const net = { chain: Promise.resolve(), last: 0, blocked: new Map(), epoch: 0 };
 
   class Cancelled extends Error {
     constructor() {
@@ -133,16 +134,34 @@
     }
   }
 
-  function rateLimitMessage() {
-    const secs = Math.ceil((net.blockedUntil - Date.now()) / 1000);
-    return `Instagram çok fazla istek dedi; ${secs} sn bekleniyor (önbellektekiler yine açılır)`;
+  class RateLimited extends Error {
+    constructor(until) {
+      super(`Instagram geçici sınır koydu; ${Math.ceil((until - Date.now()) / 1000)} sn`);
+      this.rateLimited = true;
+    }
+  }
+
+  // "/api/v1/users/123/info/?x" → "/api/v1/users/N/info/"
+  function endpointKey(path) {
+    return path
+      .split('?')[0]
+      .replace(/\/\d+(?=\/)/g, '/N')
+      .replace(/\/users\/[^/]+\/usernameinfo/, '/users/U/usernameinfo');
+  }
+
+  function blockedUntil(path) {
+    const b = net.blocked.get(endpointKey(path));
+    return b && b.until > Date.now() ? b.until : 0;
   }
 
   function igApi(path, { keep = false } = {}) {
     const epoch = net.epoch;
+    const key = endpointKey(path);
+    // Bu adres sınırdaysa sıraya bile girme, hemen yedeğe geçilsin.
+    if (blockedUntil(path)) return Promise.reject(new RateLimited(blockedUntil(path)));
     const run = async () => {
       if (!keep && epoch !== net.epoch) throw new Cancelled();
-      if (Date.now() < net.blockedUntil) throw new Error(rateLimitMessage());
+      if (blockedUntil(path)) throw new RateLimited(blockedUntil(path));
       const wait = net.last + MIN_GAP - Date.now();
       if (wait > 0) await sleep(wait);
       if (!keep && epoch !== net.epoch) throw new Cancelled();
@@ -160,13 +179,16 @@
         }
       });
       if (res.status === 429) {
-        net.strikes++;
-        net.blockedUntil = Date.now() + Math.min(10 * 60_000, 60_000 * 2 ** (net.strikes - 1));
-        throw new Error(rateLimitMessage());
+        const prev = net.blocked.get(key);
+        const strikes = (prev?.strikes || 0) + 1;
+        const until = Date.now() + Math.min(15 * 60_000, 30_000 * 2 ** (strikes - 1));
+        net.blocked.set(key, { until, strikes });
+        console.warn(`[Story Zoom] 429: ${key} ${Math.round((until - Date.now()) / 1000)} sn kullanılmayacak`);
+        throw new RateLimited(until);
       }
       if (res.status === 401 || res.status === 403) throw new Error('Instagram oturumu bulunamadı, giriş yapıp sayfayı yenileyin');
       if (!res.ok) throw new Error(`Instagram API hatası (${res.status})`);
-      net.strikes = 0;
+      if (net.blocked.has(key)) net.blocked.get(key).strikes = 0;
       return res.json();
     };
     const p = net.chain.then(run, run);
@@ -203,33 +225,105 @@
   };
 
   const HOUR = 3600_000;
+  const DAY = 24 * HOUR;
 
+  function rememberUser(username, id, extra = {}) {
+    if (!username || !id) return;
+    const prev = store.get(`u:${username}`) || {};
+    store.set(`u:${username}`, { ...prev, ...extra, id: String(id), username }, 30 * DAY);
+  }
+
+  function rememberHd(id, info) {
+    if (id && info?.url) store.set(`hd:${id}`, { url: info.url, w: info.width, h: info.height }, 6 * HOUR);
+  }
+
+  // Sayfanın kendi gömülü verilerinde kullanıcının kimliğini ara (hiç istek göndermeden).
+  function userIdFromPage(username) {
+    const u = username.replace(/[.]/g, '\\.');
+    const patterns = [
+      new RegExp(`"(?:pk|id|pk_id|profile_id|user_id)"\\s*:\\s*"?(\\d{3,})"?[^{}]{0,300}?"username"\\s*:\\s*"${u}"`),
+      new RegExp(`"username"\\s*:\\s*"${u}"[^{}]{0,300}?"(?:pk|id|pk_id)"\\s*:\\s*"?(\\d{3,})"?`)
+    ];
+    for (const script of document.querySelectorAll('script[type="application/json"], script:not([src])')) {
+      const text = script.textContent;
+      if (!text || !text.includes(`"${username}"`)) continue;
+      for (const re of patterns) {
+        const m = text.match(re);
+        if (m) return m[1];
+      }
+    }
+    return null;
+  }
+
+  // Kullanıcı adı → { id, username, profile_pic_url_hd? }
+  // Sıra: kalıcı önbellek → sayfadaki veri → usernameinfo → arama → web_profile_info.
+  // Biri sınıra takılırsa diğerine geçilir; kimlik bir kez bulununca 30 gün saklanır.
   function getProfile(username) {
     const saved = store.get(`u:${username}`);
-    if (saved) return Promise.resolve(saved);
+    if (saved?.id) return Promise.resolve(saved);
     return cached(`profile:${username}`, async () => {
-      const json = await igApi(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`);
-      const u = json?.data?.user;
-      if (!u?.id) throw new Error('Kullanıcı bulunamadı');
-      const user = { id: String(u.id), username: u.username || username, profile_pic_url_hd: u.profile_pic_url_hd, profile_pic_url: u.profile_pic_url };
-      store.set(`u:${username}`, user, 24 * HOUR);
-      return user;
+      const fromPage = userIdFromPage(username);
+      if (fromPage) {
+        rememberUser(username, fromPage);
+        return { id: fromPage, username };
+      }
+      let lastErr = null;
+      const tries = [
+        async () => {
+          const json = await igApi(`/api/v1/users/${encodeURIComponent(username)}/usernameinfo/`);
+          const u = json?.user;
+          if (!u?.pk) return null;
+          rememberHd(String(u.pk), u.hd_profile_pic_url_info);
+          return { id: String(u.pk), profile_pic_url_hd: u.profile_pic_url };
+        },
+        async () => {
+          const json = await igApi(`/api/v1/web/search/topsearch/?context=blended&query=${encodeURIComponent(username)}`);
+          const u = (json?.users || []).map((x) => x.user).find((x) => x?.username?.toLowerCase() === username.toLowerCase());
+          return u?.pk ? { id: String(u.pk), profile_pic_url_hd: u.profile_pic_url } : null;
+        },
+        async () => {
+          const json = await igApi(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`);
+          const u = json?.data?.user;
+          return u?.id ? { id: String(u.id), profile_pic_url_hd: u.profile_pic_url_hd } : null;
+        }
+      ];
+      for (const t of tries) {
+        try {
+          const r = await t();
+          if (r) {
+            rememberUser(username, r.id, { profile_pic_url_hd: r.profile_pic_url_hd });
+            return { ...r, username };
+          }
+        } catch (err) {
+          if (err.cancelled) throw err;
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error('Kullanıcı bulunamadı');
     });
   }
 
-  // Hikayeler. Ana uç nokta boş dönerse "hikaye yok" demektir; yedeklere sadece hata olursa gidilir.
-  function getReel(reelId, force = false) {
+  // Hikayeler. Yedek uç noktaya hata olursa ya da (hikaye olduğu belliyken) boş dönerse gidilir.
+  // expectStory: avatarda hikaye halkası var / hikaye sayfasındayız.
+  function getReel(reelId, force = false, expectStory = false) {
+    const isHl = String(reelId).startsWith('highlight:');
+    const key = `reel:${reelId}${expectStory ? ':x' : ''}`;
     return cached(
-      `reel:${reelId}`,
+      key,
       async () => {
+        let reel = null;
+        let answered = false;
         try {
           const json = await igApi(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelId)}`);
-          return json?.reels?.[reelId] || json?.reels_media?.find((r) => String(r.id) === String(reelId)) || json?.reels_media?.[0] || null;
+          reel = json?.reels?.[reelId] || json?.reels_media?.find((r) => String(r.id) === String(reelId)) || json?.reels_media?.[0] || null;
+          answered = true;
         } catch (err) {
-          if (err.cancelled || Date.now() < net.blockedUntil || String(reelId).startsWith('highlight:')) throw err;
-          const json = await igApi(`/api/v1/feed/user/${encodeURIComponent(reelId)}/story/`);
-          return json?.reel || json?.story || null;
+          if (err.cancelled || isHl) throw err;
         }
+        // Başarılı ve boş yanıt = hikaye yok (hikaye beklenmiyorsa yedeğe gitme).
+        if (reel?.items?.length || isHl || (answered && !expectStory)) return reel;
+        const json = await igApi(`/api/v1/feed/user/${encodeURIComponent(reelId)}/story/`);
+        return json?.reel || json?.story || reel;
       },
       force,
       3 * 60_000
@@ -464,8 +558,8 @@
         if (idx < 0 && items.length === 1) idx = 0;
         return { items, idx };
       };
-      let { items, idx } = pick(await getReel(reelId));
-      if (idx < 0) ({ items, idx } = pick(await getReel(reelId, true)));
+      let { items, idx } = pick(await getReel(reelId, false, true));
+      if (idx < 0) ({ items, idx } = pick(await getReel(reelId, true, true)));
       if (idx >= 0) {
         const list = items.map((it) => itemToMedia(it, info.label)).filter(Boolean);
         return { list, index: Math.min(idx, list.length - 1), story: true };
@@ -498,7 +592,9 @@
   function getReelsTray() {
     return cached('tray', async () => {
       const json = await igApi('/api/v1/feed/reels_tray/');
-      return (json?.tray || []).filter((t) => t.user?.username).map((t) => ({ id: String(t.user.pk ?? t.id), username: t.user.username }));
+      const tray = (json?.tray || []).filter((t) => t.user?.username).map((t) => ({ id: String(t.user.pk ?? t.id), username: t.user.username }));
+      for (const t of tray) rememberUser(t.username, t.id); // kimlikler bedavaya öğrenildi
+      return tray;
     }, false, 10 * 60_000);
   }
 
@@ -531,7 +627,7 @@
       queue.push(
         ...tray
           .filter((t) => !skipUsers.has(t.username))
-          .map((t) => async () => reelToMedia(await getReel(t.id).catch(() => null), t.username, ''))
+          .map((t) => async () => reelToMedia(await getReel(t.id, false, true).catch(() => null), t.username, ''))
       );
       return [];
     };
@@ -559,25 +655,36 @@
       const u = json?.user;
       const best = u?.hd_profile_pic_url_info?.url ? u.hd_profile_pic_url_info : largest(u?.hd_profile_pic_versions);
       if (best?.url) {
-        store.set(`hd:${user.id}`, { url: best.url, w: best.width, h: best.height }, 6 * HOUR);
+        rememberHd(user.id, best);
         return make(best.url, best.width, best.height);
       }
     } catch (err) {
       if (err.cancelled) throw err;
       console.warn('[Story Zoom] HD profil resmi alınamadı:', err);
     }
+    // Yedek: usernameinfo da HD resmi verir (farklı sınır).
+    try {
+      const json = await igApi(`/api/v1/users/${encodeURIComponent(username)}/usernameinfo/`);
+      const info = json?.user?.hd_profile_pic_url_info;
+      if (info?.url) {
+        rememberHd(user.id, info);
+        return make(info.url, info.width, info.height);
+      }
+    } catch (err) {
+      if (err.cancelled) throw err;
+    }
     const url = user.profile_pic_url_hd || user.profile_pic_url;
     return url ? make(url, 0, 0, 'Profil resmi (düşük kalite, HD alınamadı)') : null;
   }
 
-  async function resolveUserSequence(username) {
+  async function resolveUserSequence(username, hasRing = false) {
     const user = await getProfile(username);
     const loaders = [highlightsLoader({ id: user.id, username }), trayLoader(new Set([username]))];
     let list = [];
     let index = 0;
     let note = null;
     try {
-      const reel = await getReel(user.id);
+      const reel = await getReel(user.id, false, hasRing);
       list = reelToMedia(reel, username, '');
       // İlk görülmemiş hikayeden başla.
       index = Math.max(0, (reel?.items || []).findIndex((it) => reel.seen && it.taken_at > reel.seen));
@@ -635,12 +742,17 @@
       if (hl) return await resolveHighlight(hl, profileOwnerFromPath());
 
       // Avatar ya da hikaye halkası: hikayeler → öne çıkanlar → (yoksa) HD profil resmi.
-      const user = node && (storyRingUser(node) || (isProfilePic(node) ? avatarUser(node) : null));
+      const ringUser = node && storyRingUser(node);
+      const user = ringUser || (node && isProfilePic(node) ? avatarUser(node) : null);
       if (user) {
         try {
-          return await resolveUserSequence(user);
+          return await resolveUserSequence(user, Boolean(ringUser));
         } catch (err) {
           if (err.cancelled) throw err;
+          // Sınıra takıldıysak en azından sayfadaki resmi göster.
+          if (err.rateLimited && usable(dom)) {
+            return { list: [{ ...dom, id: 'profil', owner: user, label: 'Profil resmi' }], index: 0, story: false, note: `${err.message} · sayfadaki kalite` };
+          }
           throw new Error(`@${user} alınamadı: ${err.message}`);
         }
       }

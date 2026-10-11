@@ -5,7 +5,7 @@
   if (window.__igszLoaded) return;
   window.__igszLoaded = true;
 
-  const VERSION = '2.0.0';
+  const VERSION = '2.1.0';
 
   // Instagram web istemcisinin kendi kullandığı uygulama kimliği.
   const IG_APP_ID = '936619743392459';
@@ -109,6 +109,14 @@
     return m ? decodeURIComponent(m[1]) : '';
   }
 
+  function wwwClaim() {
+    try {
+      return sessionStorage.getItem('www-claim-v2') || '0';
+    } catch {
+      return '0';
+    }
+  }
+
   async function igApi(path) {
     const res = await fetch(path, {
       credentials: 'include',
@@ -116,7 +124,10 @@
         Accept: 'application/json',
         'X-IG-App-ID': IG_APP_ID,
         'X-CSRFToken': csrfToken(),
-        'X-Requested-With': 'XMLHttpRequest'
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-ASBD-ID': '129477',
+        // Instagram web istemcisi bu başlığı her istekte gönderir; bazı uç noktalar onsuz boş döner.
+        'X-IG-WWW-Claim': wwwClaim()
       }
     });
     if (res.status === 401 || res.status === 403) throw new Error('Instagram oturumu bulunamadı, giriş yapıp sayfayı yenileyin');
@@ -149,8 +160,26 @@
     return cached(
       `reel:${reelId}`,
       async () => {
-        const json = await igApi(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelId)}`);
-        return json?.reels?.[reelId] || json?.reels_media?.find((r) => String(r.id) === String(reelId)) || json?.reels_media?.[0] || null;
+        let firstError = null;
+        try {
+          const json = await igApi(`/api/v1/feed/reels_media/?reel_ids=${encodeURIComponent(reelId)}`);
+          const reel = json?.reels?.[reelId] || json?.reels_media?.find((r) => String(r.id) === String(reelId)) || json?.reels_media?.[0];
+          if (reel?.items?.length) return reel;
+        } catch (err) {
+          firstError = err;
+        }
+        // Yedek uç nokta (sadece kullanıcı hikayeleri için, öne çıkanlar için değil).
+        if (!String(reelId).startsWith('highlight:')) {
+          try {
+            const json = await igApi(`/api/v1/feed/user/${encodeURIComponent(reelId)}/story/`);
+            const reel = json?.reel || json?.story;
+            if (reel?.items?.length) return reel;
+          } catch (err) {
+            firstError ||= err;
+          }
+        }
+        if (firstError) throw firstError;
+        return null;
       },
       force
     );
@@ -394,20 +423,26 @@
   async function resolveNode(node) {
     const dom = node ? domMedia(node) : null;
 
-    if (isStoryPage() && (!node || node === findActiveStoryNode())) return resolveStory(node, dom);
+    // Hikaye sayfasında ortadaki büyük medya her zaman hikayedir (avatar değilse).
+    if (isStoryPage() && (!node || node === findActiveStoryNode() || (!isProfilePic(node) && visibleArea(node) >= 40_000))) {
+      return resolveStory(node, dom);
+    }
 
     try {
-      const ringUser = node && storyRingUser(node);
-      if (ringUser) {
-        const stories = await resolveUserStories(ringUser).catch(() => null);
-        if (stories) return stories;
-        const pic = await resolveProfilePic(ringUser).catch(() => null);
-        if (pic) return pic;
-      }
-      if (node && isProfilePic(node)) {
-        const user = avatarUser(node);
-        const pic = user && (await resolveProfilePic(user).catch(() => null));
-        if (pic) return pic;
+      // Avatar ya da hikaye halkası: önce kişinin hikayesi, yoksa HD profil resmi.
+      const user = node && (storyRingUser(node) || (isProfilePic(node) ? avatarUser(node) : null));
+      if (user) {
+        let note;
+        try {
+          const stories = await resolveUserStories(user);
+          if (stories) return stories;
+          note = 'Aktif hikaye yok, profil resmi gösteriliyor';
+        } catch (err) {
+          console.warn('[Story Zoom] Hikaye alınamadı:', err);
+          note = `Hikaye alınamadı (${err.message}), profil resmi gösteriliyor`;
+        }
+        const pic = await resolveProfilePic(user).catch(() => null);
+        if (pic) return { ...pic, note };
       }
       const code = node && shortcodeFor(node);
       if (code) return await resolvePost(code, dom);
@@ -615,6 +650,7 @@
         pv.list = res.list;
         pv.index = res.index;
         pv.story = res.story;
+        pv.note = res.note || null;
         renderPreviewMedia(pv, res.list[res.index]);
       },
       (err) => {
@@ -644,6 +680,7 @@
     const parts = [];
     if (pv.list && pv.list.length > 1) parts.push(`${pv.index + 1}/${pv.list.length}`);
     if (pv.scale > 1.01) parts.push(`${Math.round(pv.scale * 100)}%`);
+    if (pv.note && !error) parts.push(pv.note);
     parts.push(error || 'W büyüt · Q küçült · S indir' + (pv.list?.length > 1 ? ' · A/D önceki/sonraki' : '') + ' · F tam ekran' + (pv.media?.type === 'video' ? ' · M ses' : ''));
     pv.info.textContent = parts.join('  ·  ');
     pv.info.classList.toggle('igsz-error', Boolean(error));
